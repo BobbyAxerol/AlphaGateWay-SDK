@@ -1,6 +1,6 @@
 import asyncpg
 import logging
-from alphagateway.shared.config import settings
+from shared.config import settings
 
 logger = logging.getLogger("DB_MODULE")
 

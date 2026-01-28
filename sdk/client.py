@@ -3,8 +3,9 @@ import httpx
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from alphagateway.sdk.models import Side, PositionSide, OrderType
-from alphagateway.sdk.state_manager import AlphaStateManager
+from sdk.models import Side, PositionSide, OrderType, OrderIntent
+from sdk.state_manager import AlphaStateManager
+from sdk.exceptions import GatewayTimeout, GatewayReject, LockActiveException
 
 logger = logging.getLogger("AlphaSDK_V3")
 
@@ -13,116 +14,162 @@ class AlphaGateWaySDK:
         self.base_url = base_url.rstrip('/')
         self.alpha_id = alpha_id
         self.state = AlphaStateManager(alpha_id)
-        # Sử dụng AsyncClient cho hiệu năng cao
-        self.http_client = httpx.AsyncClient(timeout=1.0, limits=httpx.Limits(max_keepalive_connections=20))
+        self.client = httpx.AsyncClient(
+            timeout=2.0, 
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=100)
+        )
 
     def _gen_id(self, symbol: str) -> str:
-        """Quy tắc ID: ALPHA_SYMBOL_MS"""
-        return f"{self.alpha_id}_{symbol.replace('USDT','')}_{int(time.time()*1000)}"
+        sym_clean = symbol.replace("USDT", "").replace("/", "")
+        return f"{self.alpha_id}_{sym_clean}_{int(time.time() * 1000)}"
 
-    # --- CORE SENDER WITH RETRY & FALLBACK ---
-    async def _request(self, method: str, endpoint: str, payload: Dict, retries: int = 2):
+    async def _request(self, endpoint: str, payload: Dict):
         url = f"{self.base_url}{endpoint}"
-        for i in range(retries + 1):
-            try:
-                resp = await self.http_client.post(url, json=payload)
-                if resp.status_code == 202: return resp.json(), True
-                if resp.status_code == 429: # Rate limit
-                    await asyncio.sleep(0.1 * (i + 1))
-                    continue
-                return resp.json(), False
-            except Exception as e:
-                if i == retries:
-                    logger.error(f"🔥 SDK Fatal Error: {e}")
-                    return {"status": "SDK_TIMEOUT"}, False
-                await asyncio.sleep(0.05)
+        try:
+            resp = await self.client.post(url, json=payload)
+            if resp.status_code == 202:
+                return resp.json(), True
+            return resp.json(), False
+        except Exception as e:
+            logger.error(f"🔥 Network Error: {url} | {e}")
+            return None, False
 
-    # --- SMART ACTIONS ---
-    async def smart_order(self, symbol: str, side: Side, qty: float, 
-                          price: Optional[float] = None, 
-                          pos_side: PositionSide = PositionSide.BOTH):
-        """
-        Gửi lệnh có cơ chế Locking bảo vệ. 
-        Nếu đang có lệnh PENDING cho symbol này, SDK sẽ block ngay lập tức.
-        """
-        # 1. Check & Acquire Lock
-        if not await self.state.acquire_order_lock(symbol):
-            logger.warning(f"⚠️ Order Blocked: {symbol} is already in transition.")
-            return None
+    # --- NHÓM 1: LỆNH CHIẾN THUẬT ĐƠN LẺ ---
 
+    async def open_long(self, symbol: str, qty: float, price: Optional[float] = None):
+        return await self._smart_submit(symbol, Side.BUY, qty, price, PositionSide.LONG, intent=OrderIntent.OPEN)
+
+    async def open_short(self, symbol: str, qty: float, price: Optional[float] = None):
+        return await self._smart_submit(symbol, Side.SELL, qty, price, PositionSide.SHORT, intent=OrderIntent.OPEN)
+
+    async def close_long(self, symbol: str, qty: float, price: Optional[float] = None):
+        return await self._smart_submit(symbol, Side.SELL, qty, price, PositionSide.LONG, reduce_only=True, intent=OrderIntent.CLOSE)
+
+    async def close_short(self, symbol: str, qty: float, price: Optional[float] = None):
+        return await self._smart_submit(symbol, Side.BUY, qty, price, PositionSide.SHORT, reduce_only=True, intent=OrderIntent.CLOSE)
+
+    # --- NHÓM 2: LỆNH BULK THEO HƯỚNG (BASKET TRADING) ---
+
+    async def bulk_open_long(self, orders: List[Dict]):
+        """orders = [{'symbol': 'BTCUSDT', 'qty': 0.1}, {'symbol': 'ETHUSDT', 'qty': 1.0}]"""
+        payloads = []
+        for o in orders:
+            payloads.append(self._build_payload(
+                o['symbol'], Side.BUY, o['qty'], o.get('price'), 
+                PositionSide.LONG, "LIMIT" if o.get('price') else "MARKET", False, OrderIntent.OPEN
+            ))
+        return await self._submit_bulk_chunks(payloads)
+
+    async def bulk_open_short(self, orders: List[Dict]):
+        payloads = []
+        for o in orders:
+            payloads.append(self._build_payload(
+                o['symbol'], Side.SELL, o['qty'], o.get('price'), 
+                PositionSide.SHORT, "LIMIT" if o.get('price') else "MARKET", False, OrderIntent.OPEN
+            ))
+        return await self._submit_bulk_chunks(payloads)
+
+    # --- NHÓM 3: REBALANCE VÀ TỰ ĐỘNG HÓA ---
+
+    async def rebalance_portfolio(self, target_states: List[Dict]):
+        """Tối ưu Rebalance: Tự tính Delta, gán Intent, chia Batch 10."""
+        all_orders = []
+        for item in target_states:
+            symbol = item['symbol']
+            target_qty = float(item['target_qty'])
+            p_side = PositionSide(item.get('pos_side', 'BOTH'))
+
+            state = await self.state.get_current_state(symbol)
+            pos = state['position']
+            curr_qty = float(pos['volume']) if pos else 0.0
+            
+            delta = target_qty - curr_qty
+            if abs(delta) < 1e-8: continue
+
+            is_reduce = target_qty < curr_qty
+            if p_side in [PositionSide.LONG, PositionSide.BOTH]:
+                side = Side.BUY if delta > 0 else Side.SELL
+            else:
+                side = Side.SELL if delta > 0 else Side.BUY
+
+            all_orders.append(self._build_payload(
+                symbol, side, abs(delta), None, p_side, "MARKET", 
+                is_reduce, OrderIntent.REDUCE if is_reduce else OrderIntent.OPEN
+            ))
+        return await self._submit_bulk_chunks(all_orders)
+
+    async def emergency_close_all(self):
+        """Đóng toàn bộ vị thế đang active"""
+        active_positions = await self.state.get_active_positions()
+        if not active_positions: 
+            return {"status": "CLEAN", "count": 0}
+        
+        targets = [{"symbol": p['symbol'], "target_qty": 0, "pos_side": p['position_side']} for p in active_positions]
+        return await self.rebalance_portfolio(targets)
+
+    # --- NHÓM 4: QUẢN TRỊ LỆNH TREO & RỦI RO ---
+
+    async def update_order(self, symbol: str, orig_id: str, new_qty: float, new_price: float):
         payload = {
+            "alpha_id": self.alpha_id,
+            "symbol": symbol,
+            "orig_client_order_id": orig_id,
+            "new_client_order_id": self._gen_id(symbol),
+            "quantity": new_qty,
+            "price": new_price,
+            "intent": OrderIntent.UPDATE,
+            "alpha_send_ts": time.time()
+        }
+        return await self._request("/update", payload)
+
+    async def set_sl_tp(self, symbol: str, pos_side: PositionSide, sl_price: float = None, tp_price: float = None):
+        orders = []
+        side = Side.SELL if pos_side == PositionSide.LONG else Side.BUY
+        if sl_price:
+            orders.append(self._build_payload(symbol, side, 0, sl_price, pos_side, "STOP_MARKET", True, OrderIntent.CLOSE))
+        if tp_price:
+            orders.append(self._build_payload(symbol, side, 0, tp_price, pos_side, "TAKE_PROFIT_MARKET", True, OrderIntent.CLOSE))
+        return await self._submit_bulk_chunks(orders)
+
+    # --- LÕI XỬ LÝ HỆ THỐNG ---
+
+    async def _smart_submit(self, symbol, side, qty, price, pos_side, reduce_only=False, intent=OrderIntent.OPEN):
+        if not await self.state.acquire_order_lock(symbol):
+            logger.warning(f"⚠️ Locked: {symbol}")
+            return {"status": "SDK_LOCKED"}, False
+
+        payload = self._build_payload(symbol, side, qty, price, pos_side, "LIMIT" if price else "MARKET", reduce_only, intent)
+        res, ok = await self._request("/submit", payload)
+        if not ok: 
+            await self.state.release_order_lock(symbol)
+        return res, ok
+
+    async def _submit_bulk_chunks(self, payloads: List[Dict]):
+        """Chia nhỏ 10 lệnh/batch để tránh lỗi sàn và gateway"""
+        results = []
+        for i in range(0, len(payloads), 10):
+            chunk = payloads[i:i + 10]
+            res, ok = await self._request("/bulk", {
+                "alpha_id": self.alpha_id,
+                "orders": chunk,
+                "alpha_send_ts": time.time()
+            })
+            results.append(res)
+            await asyncio.sleep(0.05)
+        return results
+
+    def _build_payload(self, symbol, side, qty, price, pos_side, o_type, reduce_only, intent):
+        return {
             "alpha_id": self.alpha_id,
             "client_order_id": self._gen_id(symbol),
             "symbol": symbol,
             "side": side.value,
             "position_side": pos_side.value,
-            "type": "LIMIT" if price else "MARKET",
+            "type": o_type,
             "quantity": qty,
             "price": price,
-            "alpha_send_ts": time.time()
+            "reduce_only": reduce_only,
+            "intent": intent.value if isinstance(intent, OrderIntent) else intent,
+            "alpha_send_ts": time.time(),
+            "exchange": "BINANCE"
         }
-        
-        res, success = await self._request("POST", "/submit", payload)
-        
-        # Nếu gửi thất bại, giải phóng lock ngay để Alpha thử lại
-        if not success:
-            await self.state.release_order_lock(symbol)
-            
-        return res
-
-    async def sync_adjust_position(self, symbol: str, target_qty: float, price: Optional[float] = None):
-        """
-        Hàm cực mạnh cho Alpha: Tự động nhìn DB -> Tính Delta -> Đẩy lệnh.
-        Alpha chỉ cần gọi: sdk.sync_adjust_position("BTCUSDT", 0.5)
-        """
-        data = await self.state.get_current_state(symbol)
-        pos = data['position']
-        
-        # 1. Tính toán delta
-        current_qty = float(pos['volume']) if pos else 0.0
-        # Ở Binance Hedge Mode, volume luôn dương, ta phải check side
-        if pos and pos['position_type'] == 'SHORT':
-            current_qty = -current_qty
-            
-        delta = target_qty - current_qty
-        if abs(delta) < 1e-8: return "NO_CHANGE"
-
-        # 2. Xác định Side & PositionSide
-        side = Side.BUY if delta > 0 else Side.SELL
-        # Giả định dùng BOTH cho One-way hoặc phải truyền LONG/SHORT tùy setup
-        return await self.smart_order(symbol, side, abs(delta), price)
-
-    async def bulk_rebalance(self, target_portfolio: Dict[str, float]):
-        """
-        Rebalance toàn bộ danh mục bằng 1 lệnh Bulk duy nhất.
-        target_portfolio = {"BTCUSDT": 0.5, "ETHUSDT": 10.0}
-        """
-        bulk_orders = []
-        for symbol, t_qty in target_portfolio.items():
-            data = await self.state.get_current_state(symbol)
-            curr_qty = float(data['position']['volume']) if data['position'] else 0.0
-            if data['position'] and data['position']['position_type'] == 'SHORT': curr_qty = -curr_qty
-            
-            delta = t_qty - curr_qty
-            if abs(delta) > 0:
-                bulk_orders.append({
-                    "symbol": symbol,
-                    "side": "BUY" if delta > 0 else "SELL",
-                    "type": "MARKET",
-                    "quantity": abs(delta),
-                    "position_side": "BOTH"
-                })
-        
-        if bulk_orders:
-            return await self._request("POST", "/bulk", {
-                "alpha_id": self.alpha_id,
-                "orders": bulk_orders,
-                "alpha_send_ts": time.time()
-            })
-
-    async def cancel_all_for_symbol(self, symbol: str):
-        """Dọn sạch lệnh treo trước khi tính toán logic mới"""
-        data = await self.state.get_current_state(symbol)
-        for order in data['pending_orders']:
-            # Gửi lệnh cancel cho từng ID
-            pass

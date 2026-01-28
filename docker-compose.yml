@@ -1,0 +1,28 @@
+services:
+  test_case:
+    image: alphalive-layer2:v0.1.0
+    container_name: testcase_container
+    command: bash -c "poetry run python example.py >> /app/logs/test_case.log 2>&1"
+    restart: unless-stopped
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - bobby_network
+      - internal_trading_net
+
+networks:
+  bobby_network:
+    external: true
+  internal_trading_net:  
+    external: true
+    name: trading_system_executor_network
