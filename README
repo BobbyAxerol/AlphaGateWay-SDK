@@ -1,0 +1,432 @@
+# AlphaGateway SDK v4 — Hướng dẫn tích hợp chiến lược
+
+> **Phiên bản:** SDK v4 | Gateway v3  
+> **Cập nhật:** 2026-05  
+> Tài liệu này cover **toàn bộ** use-case từ lệnh đơn đến emergency close.
+
+---
+
+## 1. Setup & Khởi tạo
+
+### 1.1 Đăng ký Alpha (chỉ cần làm 1 lần, do admin thực hiện)
+
+```bash
+# Trên VPS, trong redis-cli hoặc qua docker exec:
+docker exec -it redis_service redis-cli
+
+# Thêm alpha vào whitelist active
+SADD gate:active_alphas alpha_001
+
+# Đặt API key cho alpha (thay bằng key thật)
+HSET gate:apikeys alpha_001 "s3cr3t-key-alpha-001"
+```
+
+Và insert vào Postgres (cần có trước khi gateway hoạt động):
+```sql
+INSERT INTO alphas (alpha_id, description, active) VALUES ('alpha_001', 'Momentum Strategy', true);
+INSERT INTO alpha_ledger (alpha_id, initial_balance, current_balance) VALUES ('alpha_001', 10000, 10000);
+INSERT INTO alpha_risk_config (alpha_id) VALUES ('alpha_001');
+INSERT INTO alpha_positions (alpha_id, symbol) VALUES ('alpha_001', 'BTCUSDT') ON CONFLICT DO NOTHING;
+```
+
+### 1.2 Khởi tạo SDK trong strategy
+
+```python
+import asyncio
+from sdk.client import AlphaGateWaySDK
+from sdk.state_provider import StateProvider
+
+GATEWAY_URL = "http://gateway_service:8000"  # trong docker network
+ALPHA_ID    = "alpha_001"
+API_KEY     = "s3cr3t-key-alpha-001"
+
+async def main():
+    # Cách 1: Context manager (khuyến nghị)
+    async with AlphaGateWaySDK(GATEWAY_URL, ALPHA_ID, API_KEY) as sdk:
+        res, ok = await sdk.open_long("BTCUSDT", qty=0.01)
+        print(res)
+
+    # Cách 2: Manual lifecycle
+    sdk = AlphaGateWaySDK(GATEWAY_URL, ALPHA_ID, API_KEY)
+    await sdk.connect()
+    try:
+        res, ok = await sdk.open_long("BTCUSDT", qty=0.01)
+    finally:
+        await sdk.close()
+
+asyncio.run(main())
+```
+
+---
+
+## 2. Lệnh MARKET
+
+Lệnh khớp ngay tại giá thị trường. Không cần truyền `price`.
+
+```python
+# --- Mở vị thế ---
+res, ok = await sdk.open_long("BTCUSDT", qty=0.01)
+res, ok = await sdk.open_short("ETHUSDT", qty=0.1)
+
+# --- Đóng vị thế (reduce_only tự động) ---
+res, ok = await sdk.close_long("BTCUSDT", qty=0.01)   # đóng toàn bộ hoặc 1 phần
+res, ok = await sdk.close_short("ETHUSDT", qty=0.05)
+
+# Kiểm tra kết quả
+if ok:
+    print(f"Accepted: {res['id']}")  # client_order_id
+else:
+    print(f"Rejected: {res['reason']}")
+```
+
+---
+
+## 3. Lệnh LIMIT
+
+Truyền thêm `price`. Lệnh nằm trong order book cho đến khi khớp hoặc bị hủy.
+
+```python
+# Mở LONG tại giá 95,000
+res, ok = await sdk.open_long("BTCUSDT", qty=0.01, price=95000.0)
+
+# Mở SHORT tại giá 3,200, Post-Only (Maker only — không taker)
+res, ok = await sdk.open_short("ETHUSDT", qty=0.1, price=3200.0, time_in_force="GTX")
+
+# Đóng LONG tại giá 97,000 (take profit thủ công)
+res, ok = await sdk.close_long("BTCUSDT", qty=0.01, price=97000.0)
+
+# time_in_force options:
+#   "GTC"  — Good Till Cancel (default, dùng cho hầu hết trường hợp)
+#   "IOC"  — Immediate Or Cancel (khớp ngay phần còn lại hủy)
+#   "FOK"  — Fill Or Kill (phải khớp toàn bộ không thì hủy hết)
+#   "GTX"  — Good Till Crossing / Post-Only (chỉ maker, nếu taker → reject)
+```
+
+---
+
+## 4. Stop Loss / Take Profit
+
+### 4.1 Stop Loss Market (đơn giản nhất)
+
+```python
+# SL cho vị thế LONG tại giá 93,000 — đóng toàn bộ khi giá xuống 93k
+res, ok = await sdk.set_stop_loss(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    stop_price=93000.0,
+    close_position=True,  # closePosition=True → Binance đóng toàn bộ
+)
+
+# SL đóng 1 phần (0.005 BTC)
+res, ok = await sdk.set_stop_loss(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    stop_price=93000.0,
+    qty=0.005,
+    close_position=False,
+)
+```
+
+### 4.2 Take Profit Market
+
+```python
+# TP cho vị thế LONG tại giá 100,000
+res, ok = await sdk.set_take_profit(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    stop_price=100000.0,
+    close_position=True,
+)
+
+# TP cho vị thế SHORT tại giá 2,800
+res, ok = await sdk.set_take_profit(
+    symbol="ETHUSDT",
+    pos_side=PositionSide.SHORT,
+    stop_price=2800.0,
+    close_position=True,
+)
+```
+
+### 4.3 Stop Limit (SL với giá limit cụ thể)
+
+```python
+# Kích hoạt ở 93,000 nhưng chỉ bán nếu giá >= 92,800
+res, ok = await sdk.set_stop_limit(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    stop_price=93000.0,   # giá kích hoạt
+    limit_price=92800.0,  # giá khớp tối thiểu
+    qty=0.01,
+    time_in_force="GTC",
+)
+```
+
+### 4.4 Trailing Stop Market
+
+```python
+# Trailing 1% cho vị thế LONG — giá tăng thì kéo SL lên theo
+res, ok = await sdk.set_trailing_stop(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    callback_rate=1.0,         # 1% trailing
+    close_position=True,
+)
+
+# Trailing với activation price — chỉ bắt đầu trailing khi giá đạt 98,000
+res, ok = await sdk.set_trailing_stop(
+    symbol="BTCUSDT",
+    pos_side=PositionSide.LONG,
+    callback_rate=1.5,
+    activation_price=98000.0,
+    close_position=True,
+)
+```
+
+### 4.5 Pattern hoàn chỉnh: Vào lệnh + SL + TP cùng lúc
+
+```python
+import asyncio
+
+async def open_with_risk_management():
+    # 1. Vào lệnh market
+    entry, ok = await sdk.open_long("BTCUSDT", qty=0.01)
+    if not ok:
+        return
+
+    # 2. Đặt SL + TP song song (asyncio.gather để tiết kiệm thời gian)
+    sl_res, tp_res = await asyncio.gather(
+        sdk.set_stop_loss("BTCUSDT", PositionSide.LONG, stop_price=93000.0),
+        sdk.set_take_profit("BTCUSDT", PositionSide.LONG, stop_price=100000.0),
+    )
+    print(f"Entry: {entry['id']}")
+    print(f"SL: {sl_res[0]['id']} | TP: {tp_res[0]['id']}")
+```
+
+---
+
+## 5. Quản lý lệnh đang treo
+
+### 5.1 Sửa lệnh LIMIT
+
+```python
+# Đặt LIMIT trước
+res, ok = await sdk.open_long("BTCUSDT", qty=0.01, price=95000.0)
+orig_id = res['id']  # lưu lại client_order_id
+
+# Sau đó sửa qty và price
+update_res, ok = await sdk.update_order(
+    symbol="BTCUSDT",
+    orig_client_order_id=orig_id,
+    new_qty=0.02,
+    new_price=94500.0,
+)
+```
+
+### 5.2 Hủy lệnh đang chờ
+
+```python
+cancel_res, ok = await sdk.cancel_order(
+    symbol="BTCUSDT",
+    orig_client_order_id=orig_id,
+)
+```
+
+---
+
+## 6. Bulk / Basket Trading
+
+Dùng khi cần gửi nhiều lệnh cùng lúc. SDK tự chia thành batch 5 lệnh.
+
+```python
+# Mở Long 5 symbols cùng lúc (MARKET)
+results = await sdk.bulk_open_long([
+    {"symbol": "BTCUSDT", "qty": 0.01},
+    {"symbol": "ETHUSDT", "qty": 0.1},
+    {"symbol": "SOLUSDT", "qty": 1.0},
+    {"symbol": "BNBUSDT", "qty": 0.5},
+    {"symbol": "XRPUSDT", "qty": 50.0},
+])
+
+# Mở Short với LIMIT price
+results = await sdk.bulk_open_short([
+    {"symbol": "BTCUSDT", "qty": 0.01, "price": 98000.0},
+    {"symbol": "ETHUSDT", "qty": 0.1,  "price": 3300.0},
+])
+
+# Đóng nhiều vị thế cùng lúc
+results = await sdk.bulk_close([
+    {"symbol": "BTCUSDT", "qty": 0.01, "pos_side": "LONG"},
+    {"symbol": "ETHUSDT", "qty": 0.1,  "pos_side": "SHORT"},
+    {"symbol": "SOLUSDT", "qty": 1.0,  "pos_side": "LONG", "price": 150.0},  # LIMIT
+])
+
+for r in results:
+    print(r['status'], r.get('count'), r.get('ids'))
+```
+
+---
+
+## 7. Rebalance Portfolio
+
+Tự động tính delta và gửi lệnh MARKET phù hợp.
+
+```python
+from sdk.state_provider import StateProvider
+
+provider = StateProvider(alpha_id=ALPHA_ID)
+
+# Query vị thế hiện tại
+positions = await provider.get_active_positions()
+current = {p['symbol']: p['quantity'] for p in positions}
+
+# Định nghĩa trạng thái mục tiêu
+targets = [
+    {"symbol": "BTCUSDT", "target_qty": 0.05, "current_qty": current.get("BTCUSDT", 0)},
+    {"symbol": "ETHUSDT", "target_qty": 0.5,  "current_qty": current.get("ETHUSDT", 0)},
+    {"symbol": "SOLUSDT", "target_qty": 0,     "current_qty": current.get("SOLUSDT", 0)},  # đóng hết
+]
+
+results = await sdk.rebalance_portfolio(targets)
+```
+
+---
+
+## 8. Emergency Close All
+
+```python
+from sdk.state_provider import StateProvider
+
+async def emergency_exit():
+    provider  = StateProvider(alpha_id=ALPHA_ID)
+    positions = await provider.get_active_positions()
+    
+    if not positions:
+        print("Không có vị thế nào.")
+        return
+
+    results = await sdk.emergency_close_all(positions)
+    print(f"Emergency close sent: {results}")
+```
+
+---
+
+## 9. Query State (StateProvider — read-only, không cần SDK connect)
+
+`StateProvider` kết nối thẳng DB để đọc trạng thái. Dùng cho logic strategy, không dùng để gửi lệnh.
+
+```python
+from sdk.state_provider import StateProvider
+from shared.database_module import db
+
+# Cần connect DB trước
+await db.connect()
+
+provider = StateProvider(alpha_id=ALPHA_ID)
+
+# Lấy tất cả vị thế đang mở
+positions = await provider.get_active_positions()
+# [{'symbol': 'BTCUSDT', 'quantity': 0.01, 'entry_price': 95000, ...}, ...]
+
+# Lấy vị thế 1 symbol
+btc_pos = await provider.get_active_positions(symbol="BTCUSDT")
+
+# Lấy lệnh đang treo
+pending = await provider.get_pending_orders()
+pending_btc = await provider.get_pending_orders(symbol="BTCUSDT")
+
+# Lấy thông tin balance
+ledger = await provider.get_ledger()
+# {'current_balance': 9850.0, 'total_fees': 12.5, 'total_volume': 150000.0, ...}
+```
+
+---
+
+## 10. Pattern hoàn chỉnh: Strategy Loop
+
+```python
+import asyncio
+import logging
+from sdk.client import AlphaGateWaySDK
+from sdk.state_provider import StateProvider
+from sdk.models import PositionSide
+from shared.database_module import db
+
+logger = logging.getLogger("my_strategy")
+
+GATEWAY_URL = "http://gateway_service:8000"
+ALPHA_ID    = "alpha_001"
+API_KEY     = "s3cr3t-key-alpha-001"
+
+async def run_strategy():
+    await db.connect()
+    provider = StateProvider(alpha_id=ALPHA_ID)
+
+    async with AlphaGateWaySDK(GATEWAY_URL, ALPHA_ID, API_KEY) as sdk:
+        while True:
+            try:
+                # 1. Đọc tín hiệu (logic của bạn)
+                signal = await get_signal()  # True=Long, False=Short, None=Flat
+
+                # 2. Query state từ DB
+                ledger    = await provider.get_ledger()
+                positions = await provider.get_active_positions(symbol="BTCUSDT")
+                curr_qty  = positions[0]['quantity'] if positions else 0.0
+
+                # 3. Kiểm tra drawdown
+                if ledger['current_balance'] < ledger['initial_balance'] * 0.9:
+                    logger.warning("⚠️ Drawdown > 10%, emergency close!")
+                    await sdk.emergency_close_all(positions)
+                    break
+
+                # 4. Hành động theo signal
+                if signal is True and curr_qty == 0:
+                    entry, ok = await sdk.open_long("BTCUSDT", qty=0.01)
+                    if ok:
+                        await asyncio.gather(
+                            sdk.set_stop_loss("BTCUSDT", PositionSide.LONG, stop_price=93000.0),
+                            sdk.set_take_profit("BTCUSDT", PositionSide.LONG, stop_price=99000.0),
+                        )
+
+                elif signal is False and curr_qty > 0:
+                    await sdk.close_long("BTCUSDT", qty=curr_qty)
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Strategy error: {e}")
+                await asyncio.sleep(5)
+
+    await db.disconnect()
+
+asyncio.run(run_strategy())
+```
+
+---
+
+## 11. Response Format
+
+Tất cả endpoint trả về JSON:
+
+| HTTP | Ý nghĩa | Response |
+|------|---------|----------|
+| 202  | Accepted — lệnh đã vào stream, chờ Risk Engine xử lý | `{"status": "ACCEPTED", "id": "alpha_001_BTC_1234567"}` |
+| 202  | Bulk Accepted | `{"status": "BULK_ACCEPTED", "count": 5, "ids": [...]}` |
+| 400  | Validation error / duplicate order | `{"status": "REJECTED", "reason": "DUPLICATE_ORDER_ID"}` |
+| 403  | Unauthorized hoặc API key sai | `{"status": "REJECTED", "reason": "INVALID_API_KEY"}` |
+| 429  | Rate limit (> 100 req/s) | `{"status": "REJECTED", "reason": "RATE_LIMIT_EXCEEDED"}` |
+
+> **Lưu ý quan trọng:** `202 ACCEPTED` có nghĩa là lệnh **đã vào hệ thống**, không phải đã khớp trên Binance.  
+> Kết quả khớp thực tế theo dõi qua `alpha_positions` và `binance_fills` trong DB.
+
+---
+
+## 12. Lỗi thường gặp
+
+| Lỗi | Nguyên nhân | Giải pháp |
+|-----|-------------|-----------|
+| `403 UNAUTHORIZED_ALPHA` | alpha_id chưa đăng ký | `SADD gate:active_alphas <alpha_id>` |
+| `403 INVALID_API_KEY` | API key sai | `HSET gate:apikeys <alpha_id> <key>` |
+| `400 DUPLICATE_ORDER_ID` | Gửi lại cùng `client_order_id` trong 1h | SDK tự gen ID mới mỗi lần, thường không gặp |
+| `RuntimeError: SDK chưa connect` | Quên `await sdk.connect()` | Dùng `async with` hoặc gọi `connect()` trước |
+| `TIMEOUT` | Gateway quá tải hoặc mạng | Retry với backoff, kiểm tra `GET /health` |
+| Risk Engine reject (log) | Vượt notional, drawdown, throttle | Xem `alpha_risk_config` trong DB |
